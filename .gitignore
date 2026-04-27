@@ -23,3 +23,7 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Generated artifacts under tmp/ (compiled .py + safetensors sidecars)
+tmp/models/*.py
+tmp/models/*.safetensors
+
