@@ -1,27 +1,70 @@
-# ONNXPY
+# onnxpy
 
-Template scaffold for an ONNX-to-NumPy compiler project with both a library and CLI layout.
+Compile an ONNX model directly to a Python file backed by NumPy. Each
+ONNX node becomes one Python statement. Weights are written to a
+`.safetensors` sidecar alongside the generated module.
 
-## Project Goals
+## Install
 
-- Python library under `src/onnxpy/`
-- CLI entrypoint exposed as `onnxpy`
-- Test, lint, and type-check tooling
-- Room for parser, IR, lowering, and code generation modules
-
-## Requirements
-
-- Python 3.11+
-- [Poetry](https://python-poetry.org/docs/)
-
-## Getting Started
+Requires Python 3.11+ and Poetry.
 
 ```bash
 poetry install
-poetry shell
 ```
 
-Or run commands without activating a shell:
+## Usage
+
+Compile:
+
+```bash
+poetry run onnxpy compile model.onnx -o out/model.py
+```
+
+Outputs `out/model.py` and `out/model.safetensors`.
+
+Flags:
+
+- `--weights PATH` write the sidecar somewhere other than next to the `.py`
+- `--function-name NAME` rename the generated callable (default `model`)
+- `--xp NAME` change the default array module baked into the signature (default `np`)
+
+List supported ops:
+
+```bash
+poetry run onnxpy ops
+```
+
+Library form:
+
+```python
+from onnxpy import compile_model
+
+compile_model("model.onnx", "out/model.py")
+```
+
+## Generated module
+
+```python
+from out.model import model
+import numpy as np
+
+y = model(np.zeros((1, 1, 28, 28), dtype=np.float32))
+```
+
+The generated function takes an `xp=np` keyword argument. Any
+array-API-conforming module is accepted. `Conv`, `MaxPool`,
+`AveragePool`, and ND padding fall back to NumPy internally and convert
+the result via `xp.asarray`.
+
+## Supported ops
+
+`Add, AveragePool, Cast, Concat, Constant, Conv, Div, Flatten, Gemm,
+GlobalAveragePool, Identity, LogSoftmax, MatMul, MaxPool, Mul, Relu,
+Reshape, Sigmoid, Softmax, Sub, Tanh, Transpose`.
+
+Unsupported op types raise `NotImplementedError` at compile time.
+
+## Tests
 
 ```bash
 poetry run pytest
@@ -29,51 +72,29 @@ poetry run ruff check .
 poetry run mypy src
 ```
 
-## Installing Additional Libraries
+`tests/test_ops.py` builds tiny graphs with `onnx.helper`, compiles
+them, and compares the generated output against `onnxruntime`.
+`tests/test_mnist.py` round-trips `tmp/models/mnist-8.onnx` against
+`onnxruntime` on five seeds within `atol=rtol=1e-4`.
 
-Runtime dependency:
+## Layout
 
-```bash
-poetry add <package-name>
 ```
-
-Development dependency:
-
-```bash
-poetry add --group dev <package-name>
-```
-
-## CLI
-
-The CLI entrypoint is reserved as:
-
-```bash
-poetry run onnxpy --help
-```
-
-The implementation is intentionally left as a placeholder in this template.
-
-## Suggested Layout
-
-```text
 src/onnxpy/
   cli.py
   compiler/
-    parser.py
-    ir.py
-    normalize.py
-    lower_numpy.py
-    codegen.py
+    emit.py     # graph walk, source assembly, safetensors sidecar
+    ops.py      # per-op emitters
+    helpers.py  # runtime preamble inlined into generated modules
 tests/
 docs/
+  architecture.md
 ```
 
-## Common Commands
+## Limitations
 
-```bash
-poetry install
-poetry run pytest
-poetry run ruff check .
-poetry run mypy src
-```
-
+- No control flow (`If`, `Loop`, `Scan`).
+- No sequence or optional types.
+- No multi-output ops.
+- Conv and pooling use `sliding_window_view`; correct but not fast.
+- Modern op semantics only; pre-opset-13 quirks are not normalized.

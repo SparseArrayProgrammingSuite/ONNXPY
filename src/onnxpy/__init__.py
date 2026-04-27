@@ -1,2 +1,5 @@
-"""ONNXPY library package."""
+"""ONNXPY: compile ONNX models directly to Python + NumPy source."""
 
+from .compiler import compile_model, compile_to_source, supported_ops
+
+__all__ = ["compile_model", "compile_to_source", "supported_ops"]
