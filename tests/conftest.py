@@ -11,7 +11,7 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import pytest
-from onnx import ModelProto
+from onnx import AttributeProto, ModelProto, numpy_helper
 
 from onnxpy import compile_model
 
@@ -27,9 +27,28 @@ def _load_generated(py_path: Path):
     return module
 
 
-def _arg_order(model: ModelProto) -> list[str]:
-    init_names = {t.name for t in model.graph.initializer}
-    return [vi.name for vi in model.graph.input if vi.name not in init_names]
+def _tensor_inputs(model: ModelProto) -> dict[str, np.ndarray]:
+    values = {tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer}
+    const_counter = 0
+    for node in model.graph.node:
+        if node.op_type != "Constant":
+            continue
+        tensor_attr = next(
+            (
+                attr
+                for attr in node.attribute
+                if attr.name == "value" and attr.type == AttributeProto.TENSOR
+            ),
+            None,
+        )
+        if tensor_attr is None:
+            continue
+        key = node.output[0] if node.output else f"_const_{const_counter}"
+        if key in values:
+            const_counter += 1
+            key = f"{key}__const_{const_counter}"
+        values[key] = numpy_helper.to_array(tensor_attr.t)
+    return values
 
 
 def _compile_and_run(model: ModelProto, feed: dict[str, np.ndarray], tmp_path: Path):
@@ -38,7 +57,8 @@ def _compile_and_run(model: ModelProto, feed: dict[str, np.ndarray], tmp_path: P
     py_path = tmp_path / "m.py"
     compile_model(str(onnx_path), str(py_path))
     module = _load_generated(py_path)
-    args = [feed[name] for name in _arg_order(model)]
+    values = {**feed, **_tensor_inputs(model)}
+    args = [values[name] for name in module.model_inputs]
     return module.model(*args)
 
 

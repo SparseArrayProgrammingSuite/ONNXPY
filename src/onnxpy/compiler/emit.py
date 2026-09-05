@@ -3,8 +3,7 @@
 Walks an :class:`onnx.ModelProto` in topological order and emits a
 self-contained Python module that, when imported, exposes a callable
 matching the ONNX graph's signature. Initializers and inline ``Constant``
-op tensors are written to a ``.safetensors`` sidecar that the generated
-module loads at import time.
+op tensors are emitted as ordinary computation inputs.
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ from typing import Any
 import numpy as np
 import onnx
 from onnx import AttributeProto, GraphProto, ModelProto, NodeProto, numpy_helper
-from safetensors.numpy import save_file as _save_safetensors
 
 from .helpers import HELPERS_SOURCE
 from .ops import EMITTERS
@@ -29,10 +27,8 @@ _RESERVED_NAMES = frozenset(
         "np",
         "math",
         "xp",
-        "Path",
-        "_WEIGHTS",
-        "_WEIGHTS_PATH",
-        "_onnxpy_load_safetensors",
+        "model_inputs",
+        "tensor_inputs",
     }
 )
 
@@ -69,7 +65,7 @@ class _EmitContextImpl:
     """Concrete implementation of :class:`onnxpy.compiler.ops.EmitContext`."""
 
     names: _NameAllocator
-    weights: dict[str, np.ndarray]
+    tensor_inputs: dict[str, np.ndarray]
     _const_counter: int = 0
 
     def name(self, ssa_name: str) -> str:
@@ -94,11 +90,11 @@ class _EmitContextImpl:
 
     def register_constant(self, hint: str, array: np.ndarray) -> str:
         key = hint or f"_const_{self._const_counter}"
-        if key in self.weights:
+        if key in self.tensor_inputs:
             self._const_counter += 1
             key = f"{hint}__const_{self._const_counter}"
-        self.weights[key] = array
-        return f'xp.asarray(_WEIGHTS[{key!r}])'
+        self.tensor_inputs[key] = array
+        return self.names.allocate(key, prefix="c")
 
 
 def _attr_value(a: AttributeProto) -> Any:
@@ -145,37 +141,27 @@ def compile_model(
     function_name: str = "model",
     xp_default: str = "np",
 ) -> Path:
-    """Compile an ONNX file to a Python module + safetensors sidecar.
+    """Compile an ONNX file to a Python module.
+
+    ``weights_path`` is accepted for compatibility and ignored; generated
+    modules receive all tensors as computation inputs.
 
     Returns the path to the generated ``.py`` file.
     """
 
     onnx_file = Path(onnx_path)
     out_file = Path(out_path)
-    weights_file = (
-        Path(weights_path) if weights_path is not None else out_file.with_suffix(".safetensors")
-    )
+    _ = weights_path
 
     model = onnx.load(str(onnx_file))
-    source, weights = compile_to_source(
+    source, _tensor_inputs = compile_to_source(
         model,
         function_name=function_name,
         xp_default=xp_default,
-        weights_path=weights_file,
-        relative_to=out_file.parent,
     )
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_text(source, encoding="utf-8")
-
-    weights_file.parent.mkdir(parents=True, exist_ok=True)
-    if weights:
-        _save_safetensors(
-            {k: np.ascontiguousarray(v) for k, v in weights.items()},
-            str(weights_file),
-        )
-    elif weights_file.exists():
-        weights_file.unlink()
     return out_file
 
 
@@ -184,32 +170,25 @@ def compile_to_source(
     *,
     function_name: str = "model",
     xp_default: str = "np",
-    weights_path: Path,
-    relative_to: Path | None = None,
 ) -> tuple[str, dict[str, np.ndarray]]:
-    """Return the generated Python source and the dict of tensors to persist."""
+    """Return generated Python source and tensor values required as inputs."""
 
     graph = model.graph
     _validate_op_coverage(graph)
 
     names = _NameAllocator()
-    weights: dict[str, np.ndarray] = {
+    tensor_inputs: dict[str, np.ndarray] = {
         tensor.name: numpy_helper.to_array(tensor) for tensor in graph.initializer
     }
-    initializer_names = set(weights)
+    initializer_names = set(tensor_inputs)
 
     real_inputs = [vi for vi in graph.input if vi.name not in initializer_names]
     arg_names = [names.allocate(vi.name, prefix="x") for vi in real_inputs]
-    init_local_names = {
-        tensor.name: names.allocate(tensor.name, prefix="w") for tensor in graph.initializer
-    }
-
-    ctx = _EmitContextImpl(names=names, weights=weights)
-
-    body: list[str] = []
     for tensor in graph.initializer:
-        local = init_local_names[tensor.name]
-        body.append(f'    {local} = xp.asarray(_WEIGHTS[{tensor.name!r}])')
+        names.allocate(tensor.name, prefix="w")
+
+    ctx = _EmitContextImpl(names=names, tensor_inputs=tensor_inputs)
+    body: list[str] = []
 
     for node in graph.node:
         if not node.output:
@@ -221,54 +200,57 @@ def compile_to_source(
         emitter = EMITTERS[node.op_type]
         rhs = emitter(ctx, node)
         lhs = ctx.name(node.output[0])
-        body.append(f"    {lhs} = {rhs}")
+        if lhs != rhs:
+            body.append(f"    {lhs} = {rhs}")
 
     if not graph.output:
         raise ValueError("Graph has no outputs.")
     output_names = [ctx.name(o.name) for o in graph.output]
     if len(output_names) == 1:
-        body.append(f"    return {output_names[0]}")
+        assignment_prefix = f"    {output_names[0]} = "
+        if body and body[-1].startswith(assignment_prefix):
+            body[-1] = f"    return {body[-1][len(assignment_prefix) :]}"
+        else:
+            body.append(f"    return {output_names[0]}")
     else:
         body.append(f"    return ({', '.join(output_names)},)")
 
-    signature = f"def {function_name}({', '.join(arg_names)}, *, xp={xp_default}):"
-    weights_rel = _format_relative_path(weights_path, relative_to or weights_path.parent)
-    source = _assemble_module(weights_rel, signature, body, has_weights=bool(weights))
-    return source, weights
+    tensor_arg_names = [names.allocate(name, prefix="w") for name in tensor_inputs]
+    all_arg_names = [*arg_names, *tensor_arg_names]
+    signature = f"def {function_name}({', '.join(all_arg_names)}, *, xp={xp_default}):"
+    source = _assemble_module(
+        signature,
+        body,
+        model_inputs=[*(vi.name for vi in real_inputs), *tensor_inputs.keys()],
+        tensor_inputs=tensor_inputs.keys(),
+    )
+    return source, tensor_inputs
 
 
 def _assemble_module(
-    weights_rel: str, signature: str, body: list[str], *, has_weights: bool
+    signature: str,
+    body: list[str],
+    *,
+    model_inputs: list[str],
+    tensor_inputs: Any,
 ) -> str:
     header: list[str] = [
         '"""Generated by onnxpy — do not edit by hand."""',
         "from __future__ import annotations",
         "",
+        "import numpy as np",
+        "",
+        f"model_inputs = {_literal(tuple(model_inputs))}",
+        f"tensor_inputs = {_literal(tuple(tensor_inputs))}",
+        "",
+        "",
+        HELPERS_SOURCE.rstrip(),
+        "",
+        signature,
     ]
-    if has_weights:
-        header += [
-            "from pathlib import Path",
-            "",
-            "import numpy as np",
-            "from safetensors.numpy import load_file as _onnxpy_load_safetensors",
-            "",
-            f"_WEIGHTS_PATH = Path(__file__).resolve().parent / {weights_rel!r}",
-            "_WEIGHTS = _onnxpy_load_safetensors(str(_WEIGHTS_PATH))",
-        ]
-    else:
-        header += ["import numpy as np"]
-    header += ["", "", HELPERS_SOURCE.rstrip(), "", signature]
     if not body:
         body = ["    pass"]
     return "\n".join(header + body).rstrip() + "\n"
-
-
-def _format_relative_path(path: Path, relative_to: Path) -> str:
-    try:
-        rel = os.path.relpath(path.resolve(), relative_to.resolve())
-    except ValueError:
-        rel = str(path.resolve())
-    return rel.replace(os.sep, "/")
 
 
 def _validate_op_coverage(graph: GraphProto) -> None:

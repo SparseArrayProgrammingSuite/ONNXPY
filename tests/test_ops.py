@@ -7,6 +7,8 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
+from onnxpy import compile_to_source
+
 
 def _vi(name: str, shape, dtype=TensorProto.FLOAT):
     return helper.make_tensor_value_info(name, dtype, None if shape is None else list(shape))
@@ -100,8 +102,8 @@ def test_matmul(assert_matches_ort):
 @pytest.mark.parametrize("trans_a,trans_b", [(0, 0), (1, 0), (0, 1), (1, 1)])
 def test_gemm(trans_a, trans_b, assert_matches_ort):
     rng = np.random.RandomState(42)
-    a = rng.randn(*( (4, 3) if trans_a else (3, 4) )).astype(np.float32)
-    b = rng.randn(*( (5, 4) if trans_b else (4, 5) )).astype(np.float32)
+    a = rng.randn(*((4, 3) if trans_a else (3, 4))).astype(np.float32)
+    b = rng.randn(*((5, 4) if trans_b else (4, 5))).astype(np.float32)
     c = rng.randn(3, 5).astype(np.float32)
     node = helper.make_node(
         "Gemm",
@@ -368,6 +370,37 @@ def test_constant(assert_matches_ort):
         [_vi("y", value.shape)],
     )
     assert_matches_ort(model, {"x": np.zeros_like(value)})
+
+
+def test_tensors_are_emitted_as_model_inputs():
+    shape = np.array([2, 2], dtype=np.int64)
+    bias = np.array([1.0, 2.0], dtype=np.float32)
+    const_value = np.array([[3.0, 4.0]], dtype=np.float32)
+    model = _model(
+        [
+            helper.make_node("Constant", [], ["c"], value=numpy_helper.from_array(const_value)),
+            helper.make_node("Add", ["x", "bias"], ["xb"]),
+            helper.make_node("Reshape", ["xb", "shape"], ["reshaped"]),
+            helper.make_node("Add", ["reshaped", "c"], ["y"]),
+        ],
+        [
+            _vi("x", (4,)),
+            _vi("shape", shape.shape, TensorProto.INT64),
+            _vi("bias", bias.shape),
+        ],
+        [_vi("y", None)],
+        initializers=[
+            numpy_helper.from_array(shape, name="shape"),
+            numpy_helper.from_array(bias, name="bias"),
+        ],
+    )
+
+    source, tensor_inputs = compile_to_source(model)
+
+    assert "safetensors" not in source
+    assert "_WEIGHTS" not in source
+    assert "model_inputs = ('x', 'shape', 'bias', 'c')" in source
+    assert tuple(tensor_inputs) == ("shape", "bias", "c")
 
 
 def test_cast_float_to_int(assert_matches_ort):

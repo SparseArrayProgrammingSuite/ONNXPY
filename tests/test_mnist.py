@@ -13,8 +13,10 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import pytest
+from onnx import numpy_helper
 
 from onnxpy import compile_model
 
@@ -33,7 +35,11 @@ def mnist_module(tmp_path_factory):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module
+    model = onnx.load(str(_MNIST_PATH))
+    tensor_inputs = {
+        tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer
+    }
+    return module, tensor_inputs
 
 
 @pytest.fixture(scope="module")
@@ -48,6 +54,9 @@ def test_mnist_matches_ort(mnist_module, ort_session, seed):
     rng = np.random.RandomState(seed)
     x = rng.randn(1, 1, 28, 28).astype(np.float32)
     expected = ort_session.run(["Plus214_Output_0"], {"Input3": x})[0]
-    actual = np.asarray(mnist_module.model(x))
+    module, tensor_inputs = mnist_module
+    values = {"Input3": x, **tensor_inputs}
+    args = [values[name] for name in module.model_inputs]
+    actual = np.asarray(module.model(*args))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=1e-4)
     assert int(np.argmax(actual)) == int(np.argmax(expected))

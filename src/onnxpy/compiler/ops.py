@@ -34,7 +34,7 @@ class EmitContext(Protocol):
         """Render a Python literal as source code (quotes, tuples, etc.)."""
 
     def register_constant(self, hint: str, array: np.ndarray) -> str:
-        """Store ``array`` in the safetensors sidecar and return an expr that fetches it."""
+        """Register ``array`` as a computation input and return its identifier."""
 
 
 Emitter = Callable[[EmitContext, NodeProto], str]

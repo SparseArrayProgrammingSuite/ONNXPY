@@ -1,8 +1,9 @@
 # onnxpy
 
-Compile an ONNX model directly to a Python file backed by NumPy. Each
-ONNX node becomes one Python statement. Weights are written to a
-`.safetensors` sidecar alongside the generated module.
+Compile an ONNX model directly to a Python file backed by an Array
+API-compatible namespace. Each ONNX node becomes one Python statement.
+Initializers and inline tensor constants are exposed as ordinary
+computation inputs.
 
 ## Install
 
@@ -20,11 +21,10 @@ Compile:
 poetry run onnxpy compile model.onnx -o out/model.py
 ```
 
-Outputs `out/model.py` and `out/model.safetensors`.
+Outputs `out/model.py`.
 
 Flags:
 
-- `--weights PATH` write the sidecar somewhere other than next to the `.py`
 - `--function-name NAME` rename the generated callable (default `model`)
 - `--xp NAME` change the default array module baked into the signature (default `np`)
 
@@ -45,16 +45,34 @@ compile_model("model.onnx", "out/model.py")
 ## Generated module
 
 ```python
-from out.model import model
+from out.model import model, model_inputs
 import numpy as np
 
-y = model(np.zeros((1, 1, 28, 28), dtype=np.float32))
+values = {
+    "input": np.zeros((1, 1, 28, 28), dtype=np.float32),
+    # Add initializer and Constant tensor values here.
+}
+args = [values[name] for name in model_inputs]
+y = model(*args)
 ```
 
-The generated function takes an `xp=np` keyword argument. Any
-array-API-conforming module is accepted. `Conv`, `MaxPool`,
-`AveragePool`, and ND padding fall back to NumPy internally and convert
-the result via `xp.asarray`.
+The generated module exports `model_inputs`, the full call order, and
+`tensor_inputs`, the subset that came from ONNX initializers or tensor
+`Constant` nodes. The generated function takes an `xp=np` keyword
+argument. Any Array API-conforming namespace is accepted.
+
+## SAPS Conv-2 helper
+
+The Conv-2 SAPS benchmark can be regenerated as a single module with
+the compiled ONNXPY model inlined:
+
+```bash
+poetry run python scripts/print_conv2lth_numpy.py --write-saps-benchmark
+```
+
+Without `--write-saps-benchmark`, the same script prints the generated
+benchmark source to stdout. Use `--model-only` to print just the
+generated Conv-2 model source.
 
 ## Supported ops
 
@@ -83,9 +101,11 @@ them, and compares the generated output against `onnxruntime`.
 src/onnxpy/
   cli.py
   compiler/
-    emit.py     # graph walk, source assembly, safetensors sidecar
+    emit.py     # graph walk and source assembly
     ops.py      # per-op emitters
     helpers.py  # runtime preamble inlined into generated modules
+scripts/
+  print_conv2lth_numpy.py
 tests/
 docs/
   architecture.md
@@ -96,5 +116,5 @@ docs/
 - No control flow (`If`, `Loop`, `Scan`).
 - No sequence or optional types.
 - No multi-output ops.
-- Conv and pooling use `sliding_window_view`; correct but not fast.
+- Conv and pooling lower through `xp.unfold` when the backend exposes it.
 - Modern op semantics only; pre-opset-13 quirks are not normalized.

@@ -13,13 +13,13 @@ from .compiler import compile_model, supported_ops
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="onnxpy",
-        description="Compile ONNX models directly to Python + NumPy source.",
+        description="Compile ONNX models directly to Array API Python source.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     compile_p = sub.add_parser(
         "compile",
-        help="Compile an ONNX file to a Python module + safetensors sidecar.",
+        help="Compile an ONNX file to a Python module.",
     )
     compile_p.add_argument("model", type=Path, help="Path to the input .onnx file.")
     compile_p.add_argument(
@@ -33,7 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--weights",
         type=Path,
         default=None,
-        help="Path of the .safetensors sidecar (default: alongside the .py).",
+        help=argparse.SUPPRESS,
     )
     compile_p.add_argument(
         "--function-name",
@@ -71,10 +71,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             xp_default=args.xp,
         )
         print(f"wrote {out}")
-        if args.weights is not None:
-            print(f"weights {args.weights}")
-        else:
-            print(f"weights {out.with_suffix('.safetensors')}")
         return 0
 
     parser.error(f"unknown command: {args.command}")
