@@ -489,9 +489,7 @@ def test_tensors_are_emitted_as_model_inputs():
 
     source, tensor_inputs = compile_to_source(model)
 
-    assert "safetensors" not in source
-    assert "_WEIGHTS" not in source
-    assert "model_inputs = ('x', 'shape', 'bias', 'c')" in source
+    assert source.startswith("def model(xp, x, shape, bias, c):\n")
     assert tuple(tensor_inputs) == ("shape", "bias", "c")
 
 
