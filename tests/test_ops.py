@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+
 import numpy as np
 import onnx
 import pytest
@@ -357,6 +359,96 @@ def test_conv_auto_pad(auto_pad, assert_matches_ort):
         initializers=init,
     )
     assert_matches_ort(model, {"x": x}, atol=1e-5)
+
+
+@pytest.mark.parametrize("rank", [1, 2, 3])
+@pytest.mark.parametrize("auto_pad", ["NOTSET", "SAME_UPPER", "SAME_LOWER"])
+def test_inline_spatial_pipeline(rank, auto_pad, assert_matches_ort):
+    rng = np.random.RandomState(19)
+    x = rng.randn(1, 4, *((8,) * rank)).astype(np.float32)
+    w = rng.randn(6, 2, *((3,) * rank)).astype(np.float32)
+    # Exercise SSA names matching builtins, old helper locals and temporary names.
+    weight_name = "_onnxpy_0_conv_rank"
+    padding = {"pads": [1] * (2 * rank)} if auto_pad == "NOTSET" else {"auto_pad": auto_pad}
+    model = _model(
+        [
+            helper.make_node(
+                "Conv",
+                ["range", weight_name],
+                ["kernel"],
+                group=2,
+                strides=[2] * rank,
+                **padding,
+            ),
+            helper.make_node(
+                "MaxPool",
+                ["kernel"],
+                ["patches"],
+                kernel_shape=[2] * rank,
+                strides=[2] * rank,
+            ),
+            helper.make_node(
+                "AveragePool",
+                ["patches"],
+                ["rank"],
+                kernel_shape=[2] * rank,
+            ),
+        ],
+        [_vi("range", (None, 4, *((None,) * rank)))],
+        [_vi(name, None) for name in ("kernel", "patches", "rank", "range")],
+        initializers=[numpy_helper.from_array(w, name=weight_name)],
+    )
+    source, _ = compile_to_source(model)
+    definitions = [
+        node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef)
+    ]
+    assert [node.name for node in definitions] == ["model"]
+    assert "_onnxpy_unfold" not in source
+    assert "xp.unfold(" in source
+    assert "xp.tensordot(" in source
+    assert not any(
+        isinstance(node, ast.For | ast.While | ast.comprehension)
+        for node in ast.walk(ast.parse(source))
+    )
+    assert_matches_ort(model, {"range": x}, atol=1e-5)
+
+
+@pytest.mark.parametrize("op", ["MaxPool", "AveragePool"])
+def test_pool_ceil_mode(op, assert_matches_ort):
+    x = np.random.RandomState(20).randn(1, 2, 6, 6).astype(np.float32)
+    model = _model(
+        helper.make_node(
+            op,
+            ["x"],
+            ["y"],
+            kernel_shape=[3, 3],
+            strides=[2, 2],
+            ceil_mode=1,
+        ),
+        [_vi("x", x.shape)],
+        [_vi("y", None)],
+    )
+    source, _ = compile_to_source(model)
+    assert not any(
+        isinstance(node, ast.For | ast.While | ast.comprehension)
+        for node in ast.walk(ast.parse(source))
+    )
+    assert_matches_ort(model, {"x": x})
+
+
+@pytest.mark.parametrize(
+    "dtype,onnx_dtype", [(np.int8, TensorProto.INT8), (np.uint8, TensorProto.UINT8)]
+)
+def test_max_pool_integer_padding(dtype, onnx_dtype, assert_matches_ort):
+    x = np.arange(1, 10, dtype=dtype).reshape(1, 1, 3, 3)
+    if dtype == np.int8:
+        x = -x
+    model = _model(
+        helper.make_node("MaxPool", ["x"], ["y"], kernel_shape=[2, 2], pads=[1, 1, 1, 1]),
+        [_vi("x", x.shape, onnx_dtype)],
+        [_vi("y", None, onnx_dtype)],
+    )
+    assert_matches_ort(model, {"x": x})
 
 
 def test_constant(assert_matches_ort):

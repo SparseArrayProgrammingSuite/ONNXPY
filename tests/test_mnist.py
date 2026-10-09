@@ -50,13 +50,13 @@ def ort_session():
 
 
 @pytest.mark.parametrize("seed", [0, 1, 7, 42, 1234])
-def test_mnist_matches_ort(mnist_module, ort_session, seed):
+def test_mnist_matches_ort(mnist_module, ort_session, seed, array_namespace):
     rng = np.random.RandomState(seed)
     x = rng.randn(1, 1, 28, 28).astype(np.float32)
     expected = ort_session.run(["Plus214_Output_0"], {"Input3": x})[0]
     module, tensor_inputs = mnist_module
     values = {"Input3": x, **tensor_inputs}
     args = [values[name] for name in module.model_inputs]
-    actual = np.asarray(module.model(*args))
+    actual = np.asarray(module.model(*args, xp=array_namespace))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=1e-4)
     assert int(np.argmax(actual)) == int(np.argmax(expected))

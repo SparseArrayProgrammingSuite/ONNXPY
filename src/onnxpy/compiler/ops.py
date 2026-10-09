@@ -3,7 +3,8 @@
 Each emitter receives an :class:`EmitContext` (defined as a Protocol so the
 emit module can supply the concrete implementation) and the ONNX node, and
 returns the right-hand side of the assignment that produces the node's
-single output. The orchestrator in ``emit.py`` is responsible for emitting
+single output. Multi-step operations append statements with ``ctx.emit``.
+The orchestrator in ``emit.py`` is responsible for emitting
 ``<lhs> = <rhs>`` and managing the surrounding state.
 
 Multi-output ops are not part of the MVP and will raise here.
@@ -35,6 +36,15 @@ class EmitContext(Protocol):
 
     def register_constant(self, hint: str, array: np.ndarray) -> str:
         """Register ``array`` as a computation input and return its identifier."""
+
+    def temp(self, hint: str) -> str:
+        """Allocate a temporary identifier separate from graph SSA names."""
+
+    def rank(self, ssa_name: str) -> int | None:
+        """Return a tensor's known rank, without requiring static dimensions."""
+
+    def emit(self, source: str) -> None:
+        """Append dedented statements to the generated model function."""
 
 
 Emitter = Callable[[EmitContext, NodeProto], str]
@@ -102,10 +112,12 @@ def _emit_gemm(ctx: EmitContext, node: NodeProto) -> str:
     beta = float(ctx.attr(node, "beta", 1.0))
     trans_a = int(ctx.attr(node, "transA", 0))
     trans_b = int(ctx.attr(node, "transB", 0))
-    return (
-        f"_onnxpy_gemm({a}, {b}, {c}, alpha={alpha!r}, beta={beta!r}, "
-        f"trans_a={trans_a}, trans_b={trans_b}, xp=xp)"
-    )
+    a_expr = f"xp.permute_dims({a}, (1, 0))" if trans_a else a
+    b_expr = f"xp.permute_dims({b}, (1, 0))" if trans_b else b
+    result = f"({alpha!r} * ({a_expr} @ {b_expr}))"
+    if c != "None":
+        result = f"({result} + {beta!r} * {c})"
+    return result
 
 
 def _emit_reshape(ctx: EmitContext, node: NodeProto) -> str:
@@ -113,98 +125,282 @@ def _emit_reshape(ctx: EmitContext, node: NodeProto) -> str:
     data = ctx.name(node.input[0])
     shape = ctx.name(node.input[1])
     allow_zero = int(ctx.attr(node, "allowzero", 0))
-    return f"_onnxpy_reshape({data}, {shape}, allow_zero={allow_zero}, xp=xp)"
+    target = (
+        f"tuple(int({data}.shape[i]) if int(dim) == 0 and not {allow_zero} "
+        f"else int(dim) for i, dim in enumerate({shape}))"
+    )
+    return f"xp.reshape({data}, {target})"
 
 
 def _emit_flatten(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
     axis = int(ctx.attr(node, "axis", 1))
-    return f"_onnxpy_flatten({ctx.name(node.input[0])}, axis={axis}, xp=xp)"
+    x = ctx.name(node.input[0])
+    normalized_axis = f"({axis} + {x}.ndim if {axis} < 0 else {axis})"
+    leading = f"math.prod({x}.shape[:{normalized_axis}])"
+    return f"xp.reshape({x}, ({leading}, -1))"
 
 
 def _emit_transpose(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
     perm = ctx.attr(node, "perm", None)
     perm_expr = "None" if perm is None else ctx.literal(tuple(int(p) for p in perm))
-    return f"_onnxpy_transpose({ctx.name(node.input[0])}, perm={perm_expr}, xp=xp)"
+    x = ctx.name(node.input[0])
+    if perm is None:
+        perm_expr = f"tuple(range({x}.ndim - 1, -1, -1))"
+    return f"xp.permute_dims({x}, {perm_expr})"
 
 
 def _emit_concat(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
     axis = int(ctx.attr(node, "axis", 0))
     inputs = ", ".join(ctx.name(i) for i in node.input)
-    return f"_onnxpy_concat(({inputs},), axis={axis}, xp=xp)"
+    return f"xp.concat(({inputs},), axis={axis})"
 
 
 def _emit_softmax(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
     axis = int(ctx.attr(node, "axis", -1))
-    return f"_onnxpy_softmax({ctx.name(node.input[0])}, axis={axis}, xp=xp)"
+    x = ctx.name(node.input[0])
+    normalized_axis = f"({axis} + {x}.ndim if {axis} < 0 else {axis})"
+    shifted = f"({x} - xp.max({x}, axis={normalized_axis}, keepdims=True))"
+    return f"(xp.exp({shifted}) / xp.sum(xp.exp({shifted}), axis={normalized_axis}, keepdims=True))"
 
 
 def _emit_log_softmax(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
     axis = int(ctx.attr(node, "axis", -1))
-    return f"_onnxpy_log_softmax({ctx.name(node.input[0])}, axis={axis}, xp=xp)"
+    x = ctx.name(node.input[0])
+    normalized_axis = f"({axis} + {x}.ndim if {axis} < 0 else {axis})"
+    shifted = f"({x} - xp.max({x}, axis={normalized_axis}, keepdims=True))"
+    return f"({shifted} - xp.log(xp.sum(xp.exp({shifted}), axis={normalized_axis}, keepdims=True)))"
 
 
 def _emit_global_average_pool(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
-    return f"_onnxpy_global_avg_pool({ctx.name(node.input[0])}, xp=xp)"
+    x = ctx.name(node.input[0])
+    return f"xp.mean({x}, axis=tuple(range(2, {x}.ndim)), keepdims=True)"
+
+
+def _emit_spatial_setup(ctx: EmitContext, node: NodeProto, x: str, kernel: str) -> str:
+    """Expand padding arithmetic at compile time so the model has no Python loops."""
+
+    kernel_shape = ctx.attr(node, "kernel_shape", None)
+    tensor_rank = ctx.rank(node.input[0])
+    if tensor_rank is None and node.op_type == "Conv":
+        tensor_rank = ctx.rank(node.input[1])
+    if kernel_shape is not None:
+        rank = len(kernel_shape)
+    elif tensor_rank is not None:
+        rank = tensor_rank - 2
+    else:
+        # Attribute lengths can establish rank even when value_info omits it.
+        strides = ctx.attr(node, "strides", None)
+        dilations = ctx.attr(node, "dilations", None)
+        pads = ctx.attr(node, "pads", None)
+        if strides is not None:
+            rank = len(strides)
+        elif dilations is not None:
+            rank = len(dilations)
+        elif pads is not None:
+            rank = len(pads) // 2
+        else:
+            raise NotImplementedError(f"{node.op_type} requires a known spatial rank")
+    if rank < 1:
+        raise ValueError(f"{node.op_type} requires at least one spatial dimension")
+
+    p = ctx.temp(node.op_type.lower())
+    strides = ctx.literal(tuple(int(s) for s in ctx.attr(node, "strides", (1,) * rank)))
+    dilations = ctx.literal(tuple(int(d) for d in ctx.attr(node, "dilations", (1,) * rank)))
+    pads = ctx.attr(node, "pads", None)
+    auto_pad = str(ctx.attr(node, "auto_pad", "NOTSET") or "NOTSET").upper()
+    ctx.emit(f"""
+        {p}_rank = {rank}
+        {p}_kernel = {kernel}
+        {p}_strides = {strides}
+        {p}_dilations = {dilations}
+    """)
+    if auto_pad in {"NOTSET", "VALID"}:
+        pairs = ((0, 0),) * rank
+        if auto_pad == "NOTSET" and pads is not None:
+            pairs = tuple((int(pads[i]), int(pads[i + rank])) for i in range(rank))
+        ctx.emit(f"{p}_pads = {ctx.literal(pairs)}")
+    elif auto_pad in {"SAME_UPPER", "SAME_LOWER"}:
+        pad_exprs = []
+        for i in range(rank):
+            total = f"{p}_total_{i}"
+            ctx.emit(f"""
+                {p}_size = int({x}.shape[{2 + i}])
+                {p}_stride = {p}_strides[{i}]
+                {p}_effective = ({p}_kernel[{i}] - 1) * {p}_dilations[{i}] + 1
+                {p}_out_size = -(-{p}_size // {p}_stride)
+                {total} = max(({p}_out_size - 1) * {p}_stride + {p}_effective - {p}_size, 0)
+            """)
+            before, after = f"{total} // 2", f"{total} - {total} // 2"
+            if auto_pad == "SAME_LOWER":
+                before, after = after, before
+            pad_exprs.append(f"({before}, {after})")
+        ctx.emit(f"{p}_pads = ({', '.join(pad_exprs)},)")
+    else:
+        raise ValueError(f"Unsupported auto_pad mode: {auto_pad!r}")
+
+    if int(ctx.attr(node, "ceil_mode", 0)):
+        pad_exprs = []
+        for i in range(rank):
+            pair = f"{p}_expanded_{i}"
+            ctx.emit(f"""
+                {p}_size = int({x}.shape[{2 + i}])
+                {p}_stride = {p}_strides[{i}]
+                {p}_effective = ({p}_kernel[{i}] - 1) * {p}_dilations[{i}] + 1
+                {p}_before, {p}_after = {p}_pads[{i}]
+                {p}_numerator = {p}_size + {p}_before + {p}_after - {p}_effective
+                {p}_out_size = max(-(-{p}_numerator // {p}_stride) + 1, 0)
+                {p}_needed = max(({p}_out_size - 1) * {p}_stride + {p}_effective - {p}_size, 0)
+                {pair} = (
+                    {p}_before, {p}_after + max({p}_needed - {p}_before - {p}_after, 0)
+                )
+            """)
+            pad_exprs.append(pair)
+        ctx.emit(f"{p}_pads = ({', '.join(pad_exprs)},)")
+    return p
+
+
+def _unfold_expr(x: str, p: str, fill_value: str) -> str:
+    return (
+        f"xp.unfold({x}, {p}_kernel, axes=tuple(range(2, {x}.ndim)), "
+        f"strides={p}_strides, dilations={p}_dilations, "
+        f"padding={p}_pads, fill_value={fill_value})"
+    )
+
+
+def _emit_array_like(ctx: EmitContext, value: str, like: str) -> str:
+    result = ctx.temp("scalar")
+    ctx.emit(f"""
+        try:
+            {result} = xp.asarray(
+                {value}, dtype={like}.dtype, device=getattr({like}, "device", None)
+            )
+        except TypeError:
+            {result} = xp.asarray({value}, dtype={like}.dtype)
+    """)
+    return result
 
 
 def _emit_average_pool(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
-    kernel_shape = ctx.literal(tuple(int(k) for k in ctx.attr(node, "kernel_shape", ())))
-    strides = _list_attr_expr(ctx, node, "strides")
-    pads = _list_attr_expr(ctx, node, "pads")
-    ceil_mode = int(ctx.attr(node, "ceil_mode", 0))
-    auto_pad = ctx.literal(str(ctx.attr(node, "auto_pad", "NOTSET")))
-    count_include_pad = int(ctx.attr(node, "count_include_pad", 0))
-    return (
-        f"_onnxpy_avg_pool({ctx.name(node.input[0])}, kernel_shape={kernel_shape}, "
-        f"strides={strides}, pads={pads}, ceil_mode={ceil_mode}, "
-        f"auto_pad={auto_pad}, count_include_pad={count_include_pad}, xp=xp)"
-    )
+    x = ctx.name(node.input[0])
+    kernel = _list_attr_expr(ctx, node, "kernel_shape")
+    p = _emit_spatial_setup(ctx, node, x, kernel)
+    zero = _emit_array_like(ctx, "0", x)
+    ctx.emit(f"""
+        {p}_patches = {_unfold_expr(x, p, zero)}
+        {p}_kernel_axes = tuple(range(2 + {p}_rank, 2 + 2 * {p}_rank))
+    """)
+    if int(ctx.attr(node, "count_include_pad", 0)):
+        return f"xp.mean({p}_patches, axis={p}_kernel_axes)"
+
+    ctx.emit(f"""
+        try:
+            {p}_mask = xp.ones({x}.shape, dtype={x}.dtype, device=getattr({x}, "device", None))
+        except TypeError:
+            {p}_mask = xp.ones({x}.shape, dtype={x}.dtype)
+        {p}_counts = xp.sum(
+            {_unfold_expr(f"{p}_mask", p, zero)}, axis={p}_kernel_axes
+        )
+    """)
+    one = _emit_array_like(ctx, "1", f"{p}_counts")
+    ctx.emit(f"{p}_counts = xp.maximum({p}_counts, {one})")
+    return f"xp.sum({p}_patches, axis={p}_kernel_axes) / {p}_counts"
 
 
 def _emit_max_pool(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
-    kernel_shape = ctx.literal(tuple(int(k) for k in ctx.attr(node, "kernel_shape", ())))
-    strides = _list_attr_expr(ctx, node, "strides")
-    pads = _list_attr_expr(ctx, node, "pads")
-    dilations = _list_attr_expr(ctx, node, "dilations")
-    ceil_mode = int(ctx.attr(node, "ceil_mode", 0))
-    auto_pad = ctx.literal(str(ctx.attr(node, "auto_pad", "NOTSET")))
-    return (
-        f"_onnxpy_max_pool({ctx.name(node.input[0])}, kernel_shape={kernel_shape}, "
-        f"strides={strides}, pads={pads}, dilations={dilations}, "
-        f"ceil_mode={ceil_mode}, auto_pad={auto_pad}, xp=xp)"
-    )
+    x = ctx.name(node.input[0])
+    kernel = _list_attr_expr(ctx, node, "kernel_shape")
+    p = _emit_spatial_setup(ctx, node, x, kernel)
+    ctx.emit(f"""
+        {p}_minimum = float("-inf")
+        try:
+            if xp.isdtype({x}.dtype, "integral"):
+                {p}_minimum = xp.iinfo({x}.dtype).min
+        except (AttributeError, TypeError):
+            pass
+    """)
+    minimum = _emit_array_like(ctx, f"{p}_minimum", x)
+    ctx.emit(f"{p}_patches = {_unfold_expr(x, p, minimum)}")
+    return f"xp.max({p}_patches, axis=tuple(range(2 + {p}_rank, 2 + 2 * {p}_rank)))"
 
 
 def _emit_conv(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
     x = ctx.name(node.input[0])
     w = ctx.name(node.input[1])
-    b = ctx.name(node.input[2]) if len(node.input) > 2 and node.input[2] else "None"
-    kernel_shape = _list_attr_expr(ctx, node, "kernel_shape")
-    strides = _list_attr_expr(ctx, node, "strides")
-    pads = _list_attr_expr(ctx, node, "pads")
-    dilations = _list_attr_expr(ctx, node, "dilations")
+    kernel = _list_attr_expr(ctx, node, "kernel_shape")
+    if kernel == "None":
+        kernel = f"{w}.shape[2:]"
     group = int(ctx.attr(node, "group", 1))
-    auto_pad = ctx.literal(str(ctx.attr(node, "auto_pad", "NOTSET")))
-    return (
-        f"_onnxpy_conv({x}, {w}, {b}, kernel_shape={kernel_shape}, "
-        f"strides={strides}, pads={pads}, dilations={dilations}, "
-        f"group={group}, auto_pad={auto_pad}, xp=xp)"
-    )
+    if group < 1:
+        raise ValueError("Conv group must be positive")
+    p = _emit_spatial_setup(ctx, node, x, kernel)
+    zero = _emit_array_like(ctx, "0", x)
+    ctx.emit(f"""
+        {p}_patches = {_unfold_expr(x, p, zero)}
+        {p}_axes = (
+            (1, *range(2 + {p}_rank, 2 + 2 * {p}_rank)),
+            (1, *range(2, 2 + {p}_rank)),
+        )
+        {p}_perm = (0, {p}_rank + 1, *range(1, {p}_rank + 1))
+    """)
+    if group > 1:
+        ctx.emit(f"""
+            {p}_c_per_group = {x}.shape[1] // {group}
+            {p}_m_per_group = {w}.shape[0] // {group}
+        """)
+    outputs = []
+    # ONNX group is a constant attribute. Emit separate contractions without
+    # a runtime loop or computing cross-group products.
+    for index in range(group):
+        patches = f"{p}_patches"
+        weights = w
+        if group > 1:
+            patches += f"[:, {index} * {p}_c_per_group:{index + 1} * {p}_c_per_group, ...]"
+            weights += f"[{index} * {p}_m_per_group:{index + 1} * {p}_m_per_group, ...]"
+        out = f"{p}_group_{index}"
+        ctx.emit(f"""
+            {out} = xp.tensordot({patches}, {weights}, axes={p}_axes)
+            {out} = xp.permute_dims({out}, {p}_perm)
+        """)
+        outputs.append(out)
+    result = outputs[0] if group == 1 else f"xp.concat(({', '.join(outputs)},), axis=1)"
+    if len(node.input) > 2 and node.input[2]:
+        b = ctx.name(node.input[2])
+        result = f"({result} + xp.reshape({b}, (1, {w}.shape[0], *((1,) * {p}_rank))))"
+    return result
 
 
 def _emit_cast(ctx: EmitContext, node: NodeProto) -> str:
     _require_single_output(node)
     to = int(ctx.attr(node, "to"))
-    return f"_onnxpy_cast({ctx.name(node.input[0])}, to={to}, xp=xp)"
+    dtype_names = {
+        1: "float32",
+        2: "uint8",
+        3: "int8",
+        4: "uint16",
+        5: "int16",
+        6: "int32",
+        7: "int64",
+        9: "bool",
+        10: "float16",
+        11: "float64",
+        12: "uint32",
+        13: "uint64",
+        16: "bfloat16",
+    }
+    try:
+        dtype_name = dtype_names[to]
+    except KeyError as exc:
+        raise NotImplementedError(f"ONNX Cast dtype {to} is not supported") from exc
+    return f"xp.astype({ctx.name(node.input[0])}, xp.{dtype_name}, copy=False)"
 
 
 def _emit_constant(ctx: EmitContext, node: NodeProto) -> str:
@@ -214,16 +410,16 @@ def _emit_constant(ctx: EmitContext, node: NodeProto) -> str:
         return ctx.register_constant(node.output[0], tensor)
     int_val = ctx.attr(node, "value_int", None)
     if int_val is not None:
-        return f"_onnxpy_asarray({int(int_val)!r}, 'int64', xp)"
+        return f"xp.asarray({int(int_val)!r}, dtype=xp.int64)"
     ints = ctx.attr(node, "value_ints", None)
     if ints is not None:
-        return f"_onnxpy_asarray({ctx.literal([int(i) for i in ints])}, 'int64', xp)"
+        return f"xp.asarray({ctx.literal([int(i) for i in ints])}, dtype=xp.int64)"
     float_val = ctx.attr(node, "value_float", None)
     if float_val is not None:
-        return f"_onnxpy_asarray({float(float_val)!r}, 'float32', xp)"
+        return f"xp.asarray({float(float_val)!r}, dtype=xp.float32)"
     floats = ctx.attr(node, "value_floats", None)
     if floats is not None:
-        return f"_onnxpy_asarray({ctx.literal([float(f) for f in floats])}, 'float32', xp)"
+        return f"xp.asarray({ctx.literal([float(f) for f in floats])}, dtype=xp.float32)"
     raise NotImplementedError("Constant op variant not supported in MVP (need 'value' or value_*)")
 
 

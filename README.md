@@ -1,7 +1,8 @@
 # onnxpy
 
 Compile an ONNX model directly to a Python file backed by an Array
-API-compatible namespace. Each ONNX node becomes one Python statement.
+API-compatible namespace. Each ONNX node becomes inline Python statements
+inside the generated model function, with no runtime helper definitions.
 Initializers and inline tensor constants are exposed as ordinary
 computation inputs.
 
@@ -59,7 +60,24 @@ y = model(*args)
 The generated module exports `model_inputs`, the full call order, and
 `tensor_inputs`, the subset that came from ONNX initializers or tensor
 `Constant` nodes. The generated function takes an `xp=np` keyword
-argument. Any Array API-conforming namespace is accepted.
+argument. Models with convolution or pooling require a namespace that also
+provides SAPS-style `unfold`:
+
+```python
+xp.unfold(x, kernel_shape, *, axes=None, strides=None, dilations=None,
+          padding=None, fill_value=0)
+```
+
+`padding` contains `(before, after)` pairs for the selected axes. The result
+keeps the input axes (with spatial dimensions replaced by window counts)
+and appends the kernel axes. Pass the target framework as `model(*args, xp=xp)`;
+plain NumPy does not provide `unfold`.
+
+Convolution contracts the unfolded windows with the weights using
+`xp.tensordot`. Padding arithmetic and grouped convolutions are expanded
+at compile time, so generated Conv and pooling code contains no Python loops.
+Spatial rank must be known from tensor metadata or operator attributes;
+spatial dimensions may vary at runtime.
 
 ## SAPS Conv-2 helper
 
@@ -103,7 +121,6 @@ src/onnxpy/
   compiler/
     emit.py     # graph walk and source assembly
     ops.py      # per-op emitters
-    helpers.py  # runtime preamble inlined into generated modules
 scripts/
   print_conv2lth_numpy.py
 tests/
@@ -116,5 +133,5 @@ docs/
 - No control flow (`If`, `Loop`, `Scan`).
 - No sequence or optional types.
 - No multi-output ops.
-- Conv and pooling lower through `xp.unfold` when the backend exposes it.
+- Conv and pooling require the target framework's `xp.unfold` extension.
 - Modern op semantics only; pre-opset-13 quirks are not normalized.

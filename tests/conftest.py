@@ -16,6 +16,50 @@ from onnx import AttributeProto, ModelProto, numpy_helper
 from onnxpy import compile_model
 
 
+class _NumpyWithUnfold:
+    """Test namespace implementing the SAPS unfold contract with NumPy views."""
+
+    def __getattr__(self, name):
+        return getattr(np, name)
+
+    def unfold(
+        self,
+        x,
+        kernel_shape,
+        *,
+        axes=None,
+        strides=None,
+        dilations=None,
+        padding=None,
+        fill_value=0,
+    ):
+        rank = len(kernel_shape)
+        axes = tuple(range(x.ndim - rank, x.ndim)) if axes is None else tuple(axes)
+        strides = (1,) * rank if strides is None else strides
+        dilations = (1,) * rank if dilations is None else dilations
+        padding = ((0, 0),) * rank if padding is None else padding
+        pad_width = [(0, 0)] * x.ndim
+        for axis, pair in zip(axes, padding, strict=True):
+            pad_width[axis] = pair
+        padded = np.pad(x, pad_width, constant_values=fill_value)
+        effective = tuple(
+            (kernel - 1) * dilation + 1
+            for kernel, dilation in zip(kernel_shape, dilations, strict=True)
+        )
+        windows = np.lib.stride_tricks.sliding_window_view(padded, effective, axis=axes)
+        slices = [slice(None)] * windows.ndim
+        for axis, stride in zip(axes, strides, strict=True):
+            slices[axis] = slice(None, None, stride)
+        for axis, dilation in enumerate(dilations, start=x.ndim):
+            slices[axis] = slice(None, None, dilation)
+        return windows[tuple(slices)]
+
+
+@pytest.fixture(scope="session")
+def array_namespace():
+    return _NumpyWithUnfold()
+
+
 def _load_generated(py_path: Path):
     """Import a freshly generated module under a unique name."""
 
@@ -51,7 +95,7 @@ def _tensor_inputs(model: ModelProto) -> dict[str, np.ndarray]:
     return values
 
 
-def _compile_and_run(model: ModelProto, feed: dict[str, np.ndarray], tmp_path: Path):
+def _compile_and_run(model: ModelProto, feed: dict[str, np.ndarray], tmp_path: Path, xp):
     onnx_path = tmp_path / "m.onnx"
     onnx.save(model, str(onnx_path))
     py_path = tmp_path / "m.py"
@@ -59,7 +103,7 @@ def _compile_and_run(model: ModelProto, feed: dict[str, np.ndarray], tmp_path: P
     module = _load_generated(py_path)
     values = {**feed, **_tensor_inputs(model)}
     args = [values[name] for name in module.model_inputs]
-    return module.model(*args)
+    return module.model(*args, xp=xp)
 
 
 def _run_ort(model: ModelProto, feed: dict[str, np.ndarray]):
@@ -70,7 +114,7 @@ def _run_ort(model: ModelProto, feed: dict[str, np.ndarray]):
 
 
 @pytest.fixture
-def assert_matches_ort(tmp_path):
+def assert_matches_ort(tmp_path, array_namespace):
     """Compile, execute, and compare against onnxruntime within tolerance."""
 
     def _do(
@@ -80,7 +124,7 @@ def assert_matches_ort(tmp_path):
         atol: float = 1e-5,
         rtol: float = 1e-5,
     ):
-        actual = _compile_and_run(model, feed, tmp_path)
+        actual = _compile_and_run(model, feed, tmp_path, array_namespace)
         expected = _run_ort(model, feed)
         if isinstance(expected, tuple):
             for a, e in zip(actual, expected, strict=True):
