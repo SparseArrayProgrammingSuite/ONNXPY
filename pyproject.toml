@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "onnxpy"
-version = "0.1.0"
+version = "0.2.0"
 description = "Template for an ONNX-to-NumPy compiler library and CLI."
 authors = ["Micha <you@example.com>"]
 readme = "README.md"
