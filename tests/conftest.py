@@ -12,48 +12,65 @@ from onnx import ModelProto
 from onnxpy import compile_to_source
 
 
-class _NumpyWithUnfold:
-    """Test array namespace implementing unfold with NumPy views."""
+class _NumpyWithConv:
+    """Test array namespace implementing conv and pool with NumPy views."""
 
     def __getattr__(self, name):
         return getattr(np, name)
 
-    def unfold(
-        self,
-        x,
-        kernel_shape,
-        *,
-        axes=None,
-        strides=None,
-        dilations=None,
-        padding=None,
-        fill_value=0,
-    ):
+    @staticmethod
+    def _windows(x, kernel_shape, strides, dilations, padding, fill_value):
+        """Pad x's spatial axes, then view it as (N, C, *windows, *kernel)."""
         rank = len(kernel_shape)
-        axes = tuple(range(x.ndim - rank, x.ndim)) if axes is None else tuple(axes)
+        axes = tuple(range(2, 2 + rank))
         strides = (1,) * rank if strides is None else strides
         dilations = (1,) * rank if dilations is None else dilations
         padding = ((0, 0),) * rank if padding is None else padding
-        pad_width = [(0, 0)] * x.ndim
-        for axis, pair in zip(axes, padding, strict=True):
-            pad_width[axis] = pair
-        padded = np.pad(x, pad_width, constant_values=fill_value)
+        padded = np.pad(x, [(0, 0), (0, 0), *padding], constant_values=fill_value)
         effective = tuple(
             (kernel - 1) * dilation + 1
             for kernel, dilation in zip(kernel_shape, dilations, strict=True)
         )
         windows = np.lib.stride_tricks.sliding_window_view(padded, effective, axis=axes)
-        slices = [slice(None)] * windows.ndim
-        for axis, stride in zip(axes, strides, strict=True):
-            slices[axis] = slice(None, None, stride)
-        for axis, dilation in enumerate(dilations, start=x.ndim):
-            slices[axis] = slice(None, None, dilation)
-        return windows[tuple(slices)]
+        steps = (
+            *(slice(None, None, stride) for stride in strides),
+            *(slice(None, None, dilation) for dilation in dilations),
+        )
+        return windows[(slice(None), slice(None), *steps)]
+
+    def conv(self, x, w, *, strides=None, dilations=None, padding=None, group=1):
+        rank = w.ndim - 2
+        n, c, *_ = x.shape
+        m = w.shape[0]
+        windows = self._windows(x, w.shape[2:], strides, dilations, padding, 0)
+        windows = windows.reshape(n, group, c // group, *windows.shape[2:])
+        w = w.reshape(group, m // group, c // group, *w.shape[2:])
+        spatial = list(range(4, 4 + rank))
+        kernel = list(range(4 + rank, 4 + 2 * rank))
+        y = np.einsum(
+            windows, [0, 1, 2, *spatial, *kernel], w, [1, 3, 2, *kernel], [0, 1, 3, *spatial]
+        )
+        return y.reshape(n, m, *y.shape[3:])
+
+    def pool(
+        self,
+        x,
+        kernel_shape,
+        *,
+        reduce,
+        strides=None,
+        dilations=None,
+        padding=None,
+        fill_value=0,
+    ):
+        windows = self._windows(x, kernel_shape, strides, dilations, padding, fill_value)
+        reduce_op = {"max": np.max, "+": np.sum, "mean": np.mean}[reduce]
+        return reduce_op(windows, axis=tuple(range(x.ndim, windows.ndim)))
 
 
 @pytest.fixture(scope="session")
 def array_namespace():
-    return _NumpyWithUnfold()
+    return _NumpyWithConv()
 
 
 def _compile_and_run(model: ModelProto, feed: dict[str, np.ndarray], xp):

@@ -265,11 +265,10 @@ def _emit_spatial_setup(ctx: EmitContext, node: NodeProto, x: str, kernel: str) 
     return p
 
 
-def _unfold_expr(x: str, p: str, fill_value: str) -> str:
+def _pool_expr(x: str, p: str, reduce: str, fill_value: str) -> str:
     return (
-        f"xp.unfold({x}, {p}_kernel, axes=tuple(range(2, {x}.ndim)), "
-        f"strides={p}_strides, dilations={p}_dilations, "
-        f"padding={p}_pads, fill_value={fill_value})"
+        f"xp.pool({x}, {p}_kernel, reduce={reduce!r}, strides={p}_strides, "
+        f"dilations={p}_dilations, padding={p}_pads, fill_value={fill_value})"
     )
 
 
@@ -291,26 +290,21 @@ def _emit_average_pool(ctx: EmitContext, node: NodeProto) -> str:
     x = ctx.name(node.input[0])
     kernel = _list_attr_expr(ctx, node, "kernel_shape")
     p = _emit_spatial_setup(ctx, node, x, kernel)
-    zero = _emit_array_like(ctx, "0", x)
-    ctx.emit(f"""
-        {p}_patches = {_unfold_expr(x, p, zero)}
-        {p}_kernel_axes = tuple(range(2 + {p}_rank, 2 + 2 * {p}_rank))
-    """)
     if int(ctx.attr(node, "count_include_pad", 0)):
-        return f"xp.mean({p}_patches, axis={p}_kernel_axes)"
+        return _pool_expr(x, p, "mean", "0")
 
+    # Average only the input entries in each window: sum them, then divide by
+    # how many there are.
     ctx.emit(f"""
         try:
             {p}_mask = xp.ones({x}.shape, dtype={x}.dtype, device=getattr({x}, "device", None))
         except TypeError:
             {p}_mask = xp.ones({x}.shape, dtype={x}.dtype)
-        {p}_counts = xp.sum(
-            {_unfold_expr(f"{p}_mask", p, zero)}, axis={p}_kernel_axes
-        )
+        {p}_counts = {_pool_expr(f"{p}_mask", p, "+", "0")}
     """)
     one = _emit_array_like(ctx, "1", f"{p}_counts")
     ctx.emit(f"{p}_counts = xp.maximum({p}_counts, {one})")
-    return f"xp.sum({p}_patches, axis={p}_kernel_axes) / {p}_counts"
+    return f"{_pool_expr(x, p, '+', '0')} / {p}_counts"
 
 
 def _emit_max_pool(ctx: EmitContext, node: NodeProto) -> str:
@@ -326,9 +320,7 @@ def _emit_max_pool(ctx: EmitContext, node: NodeProto) -> str:
         except (AttributeError, TypeError):
             pass
     """)
-    minimum = _emit_array_like(ctx, f"{p}_minimum", x)
-    ctx.emit(f"{p}_patches = {_unfold_expr(x, p, minimum)}")
-    return f"xp.max({p}_patches, axis=tuple(range(2 + {p}_rank, 2 + 2 * {p}_rank)))"
+    return _pool_expr(x, p, "max", f"{p}_minimum")
 
 
 def _emit_conv(ctx: EmitContext, node: NodeProto) -> str:
@@ -342,36 +334,10 @@ def _emit_conv(ctx: EmitContext, node: NodeProto) -> str:
     if group < 1:
         raise ValueError("Conv group must be positive")
     p = _emit_spatial_setup(ctx, node, x, kernel)
-    zero = _emit_array_like(ctx, "0", x)
-    ctx.emit(f"""
-        {p}_patches = {_unfold_expr(x, p, zero)}
-        {p}_axes = (
-            (1, *range(2 + {p}_rank, 2 + 2 * {p}_rank)),
-            (1, *range(2, 2 + {p}_rank)),
-        )
-        {p}_perm = (0, {p}_rank + 1, *range(1, {p}_rank + 1))
-    """)
-    if group > 1:
-        ctx.emit(f"""
-            {p}_c_per_group = {x}.shape[1] // {group}
-            {p}_m_per_group = {w}.shape[0] // {group}
-        """)
-    outputs = []
-    # ONNX group is a constant attribute. Emit separate contractions without
-    # a runtime loop or computing cross-group products.
-    for index in range(group):
-        patches = f"{p}_patches"
-        weights = w
-        if group > 1:
-            patches += f"[:, {index} * {p}_c_per_group:{index + 1} * {p}_c_per_group, ...]"
-            weights += f"[{index} * {p}_m_per_group:{index + 1} * {p}_m_per_group, ...]"
-        out = f"{p}_group_{index}"
-        ctx.emit(f"""
-            {out} = xp.tensordot({patches}, {weights}, axes={p}_axes)
-            {out} = xp.permute_dims({out}, {p}_perm)
-        """)
-        outputs.append(out)
-    result = outputs[0] if group == 1 else f"xp.concat(({', '.join(outputs)},), axis=1)"
+    result = (
+        f"xp.conv({x}, {w}, strides={p}_strides, dilations={p}_dilations, "
+        f"padding={p}_pads, group={group})"
+    )
     if len(node.input) > 2 and node.input[2]:
         b = ctx.name(node.input[2])
         result = f"({result} + xp.reshape({b}, (1, {w}.shape[0], *((1,) * {p}_rank))))"

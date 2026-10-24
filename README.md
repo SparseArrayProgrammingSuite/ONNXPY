@@ -57,20 +57,22 @@ Python builtins, `xp`, `np`, `math`, or compiler temporaries (`_onnxpy_*`).
 ## Convolution and pooling
 
 Models with convolution or pooling require an array namespace that provides
-`unfold` in addition to Array API operations:
+`conv` and `pool` in addition to Array API operations:
 
 ```python
-xp.unfold(x, kernel_shape, *, axes=None, strides=None, dilations=None,
-          padding=None, fill_value=0)
+xp.conv(x, w, *, strides=None, dilations=None, padding=None, group=1)
+xp.pool(x, kernel_shape, *, reduce, strides=None, dilations=None,
+        padding=None, fill_value=0)
 ```
 
-`padding` contains `(before, after)` pairs for the selected axes. The result
-keeps the input axes (with spatial dimensions replaced by window counts)
-and appends the kernel axes. Plain NumPy does not provide `unfold`.
+`x` has shape `(N, C, *spatial)`, `w` has shape `(M, C / group, *kernel)`, and
+`padding` contains a `(before, after)` pair for each spatial axis, padded with
+zeros for `conv` and with `fill_value` for `pool`. `reduce` is `"max"`, `"+"`
+or `"mean"`. Plain NumPy provides neither; SAPS frameworks provide both.
 
-Convolution contracts the unfolded windows with the weights using
-`xp.tensordot`. Padding arithmetic and grouped convolutions are expanded
-at compile time, so generated Conv and pooling code contains no Python loops.
+Padding arithmetic is expanded at compile time, so generated Conv and pooling
+code contains no Python loops. AveragePool without `count_include_pad`
+divides a sum pool of the input by a sum pool of ones.
 Spatial rank must be known from tensor metadata or operator attributes;
 spatial dimensions may vary at runtime.
 
@@ -101,5 +103,5 @@ convention. `tests/test_mnist.py` checks `tmp/models/mnist-8.onnx` against
 - No control flow (`If`, `Loop`, `Scan`).
 - No sequence or optional types.
 - No multi-output ops.
-- Conv and pooling require the target namespace's `xp.unfold` extension.
+- Conv and pooling require the target namespace's `xp.conv` and `xp.pool` extensions.
 - Modern op semantics only; pre-opset-13 quirks are not normalized.

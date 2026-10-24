@@ -403,9 +403,9 @@ def test_inline_spatial_pipeline(rank, auto_pad, assert_matches_ort):
         node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef)
     ]
     assert [node.name for node in definitions] == ["model"]
-    assert "_onnxpy_unfold" not in source
-    assert "xp.unfold(" in source
-    assert "xp.tensordot(" in source
+    assert "unfold" not in source
+    assert "xp.conv(" in source
+    assert "xp.pool(" in source
     assert not any(
         isinstance(node, ast.For | ast.While | ast.comprehension)
         for node in ast.walk(ast.parse(source))
